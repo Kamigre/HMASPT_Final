@@ -1,0 +1,636 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.gridspec as gridspec
+from typing import List, Dict, Any, Tuple
+from datetime import datetime
+import textwrap
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from config import CONFIG
+
+# --- GLOBAL STYLE SETTINGS ---
+sns.set_theme(style="whitegrid", context="talk", font_scale=0.9)
+plt.rcParams['figure.dpi'] = 150
+plt.rcParams['savefig.bbox'] = 'tight'
+plt.rcParams['axes.titlesize'] = 16
+plt.rcParams['axes.titleweight'] = 'bold'
+plt.rcParams['font.family'] = 'sans-serif'
+
+class PortfolioVisualizer:
+    """
+    Creates institutional-grade visual reports for pairs trading performance.
+    Features homogenized styling, intelligent data summarization, and AI Text Reports.
+    
+    REFRACTORED: Leverages the comprehensive final_summary from SupervisorAgent
+    to avoid redundant portfolio-level aggregation calculations.
+    """
+    
+    def __init__(self, output_dir: str = "reports"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
+        
+        # Institutional Color Palette
+        self.colors = {
+            'primary': '#2c3e50',       # Dark Slate (Prices/Equity)
+            'profit': '#27ae60',        # Emerald Green
+            'loss': '#c0392b',          # Pomegranate Red
+            'drawdown': '#e74c3c',      # Soft Red
+            'zscore': '#8e44ad',        # Purple
+            'fill_profit': '#2ecc71',
+            'fill_loss': '#e74c3c',
+            'neutral': '#95a5a6',
+            'accent': '#f39c12',        # Original Orange (Warnings)
+            'text_bg': '#fdfefe',       # Very light grey for text card
+            'asset_x': '#2980b9',       # Blue for Asset X
+            'asset_y': '#7f8c8d'        # Grey for Asset Y
+        }
+    
+    def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
+        """
+        Create detailed visualization for a single pair including Z-Score, Drawdown,
+        AND Price Co-movement vs. Position.
+        """
+        if len(traces) == 0:
+            return
+        
+        # --- Data Prep ---
+        df = pd.DataFrame(traces)
+        
+        # Fill missing columns for robustness
+        required_cols = {
+            'forced_close': False, 'trade_occurred': False, 'daily_return': 0.0,
+            'realized_pnl': 0.0, 'max_drawdown': 0.0, 'cum_return': 0.0, 'position': 0.0,
+            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0, 'num_trades': 0,
+            'price_x': np.nan, 'price_y': np.nan 
+        }
+        for col, val in required_cols.items():
+            if col not in df.columns: df[col] = val
+
+        # 1. FIX: Anchor Equity Curve to 100 at Step 0
+        start_step = df['local_step'].iloc[0] - 1
+        plot_steps = [start_step] + df['local_step'].tolist()
+        
+        raw_equity = (100 * (1 + df['cum_return'])).tolist()
+        plot_equity = [100.0] + raw_equity
+        
+        df['cum_return_pct'] = df['cum_return'] * 100
+        df['drawdown_pct'] = df['max_drawdown'] * 100
+        
+        forced_exit = df[df['forced_close'] == True]
+
+        # 2. FIX: Trade Counting
+        if 'num_trades' in df.columns and not df['num_trades'].empty:
+            total_entries = int(df['num_trades'].max())
+        else:
+            total_entries = len(df[df['trade_occurred'] == True])
+
+        # 3. Win Rate Logic (Per Pair)
+        closed_trades_mask = df['realized_pnl_this_step'] != 0
+        closed_trades_df = df[closed_trades_mask].copy()
+        
+        closed_trades_df['net_trade_pnl'] = closed_trades_df['realized_pnl_this_step'] - closed_trades_df['transaction_costs']
+        
+        total_closed_trades = len(closed_trades_df)
+        if total_closed_trades > 0:
+            winning_trades = (closed_trades_df['net_trade_pnl'] > 0).sum()
+            win_rate = winning_trades / total_closed_trades
+        else:
+            win_rate = 0.0
+            
+        total_pnl = df['realized_pnl'].iloc[-1]
+        final_ret = df['cum_return'].iloc[-1]
+
+        # --- Extract Ticker Names ---
+        if '-' in pair_name:
+            ticker_x, ticker_y = pair_name.split('-', 1)
+        else:
+            ticker_x, ticker_y = "Asset X", "Asset Y"
+
+        # --- Plotting ---
+        # 5 rows for: Equity, Z-Score, Price/Position, Drawdown/Returns, P&L
+        fig = plt.figure(figsize=(20, 18)) 
+        gs = gridspec.GridSpec(5, 4, figure=fig, hspace=0.5, wspace=0.3)
+        
+        # Title
+        status_color = self.colors['loss'] if was_skipped else self.colors['primary']
+        status_text = f" | STOPPED: {skip_info['reason']}" if was_skipped and skip_info else ""
+        fig.suptitle(f"{pair_name} Performance Analysis{status_text}", 
+                             fontsize=22, weight='bold', color=status_color, y=0.98)
+        
+        steps = df['local_step']
+
+        # 1. Equity Curve (gs[0, :3])
+        ax1 = fig.add_subplot(gs[0, :3])
+        ax1.plot(plot_steps, plot_equity, color=self.colors['primary'], lw=2.5, label='Portfolio Value')
+        ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
+        
+        ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
+                              where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
+        ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
+                              where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
+
+        if not forced_exit.empty:
+            ax1.scatter(forced_exit['local_step'], 100 * (1 + forced_exit['cum_return']), 
+                                color=self.colors['accent'], s=200, marker='X', label='Forced Exit', zorder=5, edgecolor='white')
+
+        ax1.set_ylabel('Equity (Base 100)')
+        ax1.set_title('Equity Curve', loc='left')
+        ax1.legend(loc='upper left', frameon=True)
+        ax1.grid(True, alpha=0.3)
+
+        # 2. Scorecard (gs[0, 3])
+        ax2 = fig.add_subplot(gs[0, 3])
+        ax2.axis('off')
+        
+        metrics_summary = [
+            ("Total P&L", f"${total_pnl:,.2f}", self.colors['profit'] if total_pnl > 0 else self.colors['loss']),
+            ("Return", f"{final_ret*100:+.2f}%", self.colors['profit'] if final_ret > 0 else self.colors['loss']),
+            ("Max Drawdown", f"{df['max_drawdown'].max()*100:.2f}%", self.colors['drawdown']),
+            ("Trade Win Rate", f"{win_rate*100:.1f}%", self.colors['primary']), 
+            ("Sharpe", f"{self._calculate_sharpe(df['daily_return']):.2f}", self.colors['primary']),
+            ("Sortino", f"{self._calculate_sortino(df['daily_return']):.2f}", self.colors['primary']),
+            ("Trades Executed", f"{total_entries}", self.colors['primary'])
+        ]
+        
+        y_pos = 0.9
+        ax2.text(0.5, 1.0, "Key Metrics", ha='center', fontsize=18, weight='bold', color=self.colors['primary'])
+        
+        for label, value, color in metrics_summary:
+            ax2.text(0.1, y_pos, label, ha='left', fontsize=14, color=self.colors['neutral'])
+            ax2.text(0.9, y_pos, value, ha='right', fontsize=15, weight='bold', color=color)
+            ax2.plot([0.1, 0.9], [y_pos-0.05, y_pos-0.05], color='#ecf0f1', lw=1.5)
+            y_pos -= 0.15
+
+        # 3. Z-Score & Position (gs[1, :])
+        ax3 = fig.add_subplot(gs[1, :])
+        
+        if 'z_score' in df.columns:
+            zscore = df['z_score']
+            ax3.plot(steps, zscore, color=self.colors['zscore'], alpha=0.8, lw=1.5, label='Spread Z-Score')
+        elif 'current_spread' in df.columns:
+            spread = df['current_spread']
+            zscore = (spread - spread.rolling(30).mean()) / (spread.rolling(30).std() + 1e-8)
+            ax3.plot(steps, zscore, color=self.colors['zscore'], alpha=0.8, lw=1.5, label='Spread Z-Score (Est)')
+
+        ax3.axhline(2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
+        ax3.axhline(-2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
+        ax3.axhline(0, color=self.colors['primary'], lw=1)
+        ax3.set_ylabel('Z-Score')
+        
+        ax3b = ax3.twinx()
+        
+        # --- REVERT POSITION STYLE (Subplot 3): Gray background fill with black text ---
+        ax3b.fill_between(steps, df['position'], color='black', alpha=0.1, step='post', label='Position Size')
+        ax3b.step(steps, df['position'], color='black', lw=0.8, where='post') # Add faint line border
+        ax3b.set_ylabel('Position', color='black') # Black text
+        ax3b.tick_params(axis='y', labelcolor='black') # Black text
+        ax3b.grid(False)
+        # --- END REVERT POSITION STYLE ---
+
+        ax3.set_title('Z-Score Signal vs. Position', loc='left')
+        plt.setp(ax3.get_xticklabels(), visible=False)
+
+        # --- 4. NEW PLOT: Price Co-movement vs. Position (gs[2, :]) ---
+        ax4 = fig.add_subplot(gs[2, :], sharex=ax3) 
+        
+        if 'price_x' in df.columns and 'price_y' in df.columns and not df[['price_x', 'price_y']].isnull().all().any():
+            df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
+            df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
+            
+            # Update Legend: Remove (Norm)
+            ax4.plot(steps, df['norm_x'], color=self.colors['asset_x'], lw=1.5, label=f"{ticker_x}")
+            ax4.plot(steps, df['norm_y'], color=self.colors['asset_y'], lw=1.5, label=f"{ticker_y}")
+            
+            ax4.set_ylabel("Normalized Price")
+            ax4.legend(loc='upper left', ncol=2, fontsize=10)
+            ax4.grid(True, alpha=0.3)
+
+            # Secondary Y-axis for Position Execution
+            ax4b = ax4.twinx()
+            
+            # --- REVERT POSITION STYLE (Subplot 4): Gray background fill with black text ---
+            ax4b.fill_between(steps, df['position'], color='black', alpha=0.1, step='post', label='Position Size')
+            ax4b.step(steps, df['position'], color='black', lw=0.8, where='post') # Add faint line border
+            ax4b.set_ylabel('Position', color='black') # Black text
+            ax4b.tick_params(axis='y', labelcolor='black') # Black text
+            ax4b.grid(False)
+            # --- END REVERT POSITION STYLE ---
+            
+            # Update Title: Remove Ticker Names
+            ax4.set_title(f"Normalized Price Co-movement vs. Position", loc='left')
+        else:
+            ax4.text(0.5, 0.5, "Price Data Unavailable for Co-movement Analysis", ha='center', va='center', fontsize=14, color=self.colors['neutral'])
+            ax4.axis('off')
+        
+        # 5. Drawdown (gs[3, :2])
+        ax5 = fig.add_subplot(gs[3, :2])
+        ax5.fill_between(steps, 0, -df['drawdown_pct'], color=self.colors['drawdown'], alpha=0.3)
+        ax5.plot(steps, -df['drawdown_pct'], color=self.colors['drawdown'], lw=1.5)
+        ax5.set_title('Underwater Plot (Drawdown %)', loc='left')
+        ax5.set_ylabel('Drawdown %')
+        ax5.grid(True, alpha=0.3)
+
+        # 6. Daily Returns (gs[3, 2:])
+        ax6 = fig.add_subplot(gs[3, 2:])
+        if not df[df['daily_return'] != 0].empty:
+            sns.histplot(df[df['daily_return'] != 0]['daily_return'], kde=True, ax=ax6, color=self.colors['primary'], alpha=0.6)
+        ax6.axvline(0, color='black', linestyle='--', alpha=0.5)
+        ax6.set_title('Daily Returns Distribution', loc='left')
+        ax6.set_xlabel('Return')
+
+        # 7. Cumulative P&L (gs[4, :])
+        ax7 = fig.add_subplot(gs[4, :])
+        cum_pnl = df['realized_pnl']
+        ax7.plot(steps, cum_pnl, color=self.colors['primary'], lw=2)
+        ax7.fill_between(steps, 0, cum_pnl, where=(cum_pnl>=0), color=self.colors['fill_profit'], alpha=0.2)
+        ax7.fill_between(steps, 0, cum_pnl, where=(cum_pnl<0), color=self.colors['fill_loss'], alpha=0.2)
+        ax7.set_title('Cumulative Realized P&L ($)', loc='left')
+        ax7.set_xlabel("Trading Steps")
+        ax7.grid(True, alpha=0.3)
+
+        # Save
+        filename = f"{pair_name.replace('-', '_')}_analysis.png"
+        filepath = os.path.join(self.output_dir, "pairs", filename)
+        plt.savefig(filepath)
+        plt.close()
+        print(f"    📊 Saved pair analysis: {filepath}")
+
+    def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
+        """
+        Create aggregated portfolio dashboard with CLEANER X-AXIS and formatted table.
+        """
+        metrics = final_summary.get('metrics', {})
+        pair_summaries = metrics.get('pair_summaries', [])
+        
+        # --- Data Processing ---
+        df_all = pd.DataFrame(all_traces)
+        if df_all.empty:
+            print("⚠️ No traces to visualize.")
+            return
+
+        if 'realized_pnl_this_step' not in df_all.columns: df_all['realized_pnl_this_step'] = 0.0
+        if 'transaction_costs' not in df_all.columns: df_all['transaction_costs'] = 0.0
+
+        # --- Global Trade Counting ---
+        trade_events = df_all[df_all['realized_pnl_this_step'] != 0].copy()
+        total_global_trades = len(trade_events)
+
+        time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
+        if time_col not in df_all.columns and 'step' in df_all.columns:
+             time_col = 'step'
+        
+        # Ensure time sorting
+        if time_col == 'timestamp':
+            df_all[time_col] = pd.to_datetime(df_all[time_col])
+        df_all = df_all.sort_values(by=time_col)
+
+        # --- 1. METRIC EXTRACTION & ALIGNMENT ---
+        plot_values = metrics.get('equity_curve', [100.0])
+        plot_index_raw = metrics.get('equity_curve_dates', [])
+        
+        # FIX 1: Generate a numeric index for plotting to avoid string-clutter
+        # We will use this 0..N range for the X-axis positions
+        x_numeric = np.arange(len(plot_values))
+        
+        # Prepare labels (dates or steps)
+        if len(plot_index_raw) == len(plot_values):
+            x_labels = plot_index_raw
+        else:
+            x_labels = [str(i) for i in x_numeric]
+            
+        # Metrics
+        final_pnl = metrics.get('total_pnl', 0.0)
+        final_pct = metrics.get('cum_return', 0.0) * 100
+        agg_sharpe = metrics.get('sharpe_ratio', 0.0)
+        agg_sortino = metrics.get('sortino_ratio', 0.0)
+        portfolio_max_dd = metrics.get('max_drawdown', 0.0)
+        global_win_rate = metrics.get('win_rate', 0.0)
+        var_95 = metrics.get('var_95', 0.0)
+        cvar_95 = metrics.get('cvar_95', 0.0)
+        
+        print(f"    ℹ️  Global Metrics: Sharpe={agg_sharpe:.2f}, MaxDD={portfolio_max_dd*100:.2f}%")
+
+        # --- Figure Setup ---
+        fig = plt.figure(figsize=(22, 16))
+        gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25)
+        
+        fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
+                             fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
+
+        # 1. Main Equity Curve (Cleaned X-Axis)
+        ax1 = fig.add_subplot(gs[0, :])
+        
+        # Plot against numeric index 0..N
+        ax1.plot(x_numeric, plot_values, color=self.colors['primary'], lw=3, label='Portfolio Value')
+        
+        if len(plot_values) > 1:
+            ax1.fill_between(x_numeric, 100, plot_values, color=self.colors['primary'], alpha=0.1)
+        
+        ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
+
+        # FIX 2: Sparse X-Axis Ticks
+        # Only show ~12 ticks across the entire range to prevent clutter
+        if len(x_numeric) > 12:
+            tick_indices = np.linspace(0, len(x_numeric) - 1, 12, dtype=int)
+            ax1.set_xticks(tick_indices)
+            
+            # Format labels (if they are long timestamps, shorten them)
+            final_labels = []
+            for i in tick_indices:
+                lbl = str(x_labels[i])
+                # If label is a long timestamp string (e.g. 2023-01-01 00:00:00), keep just date
+                if len(lbl) > 10 and '-' in lbl: 
+                    lbl = lbl[:10] 
+                final_labels.append(lbl)
+            ax1.set_xticklabels(final_labels)
+        else:
+            # If few points, show all
+            ax1.set_xticks(x_numeric)
+            ax1.set_xticklabels([str(l)[:10] for l in x_labels])
+
+        # FIX 3: Grid only on Y-axis (Horizontal lines only)
+        ax1.grid(True, axis='y', alpha=0.3)
+        
+        # Right Axis for % Return
+        ax1_right = ax1.twinx()
+        ax1_right.set_ylim(ax1.get_ylim())
+        ax1_right.set_yticks(ax1.get_yticks())
+        ax1_right.set_yticklabels([f"{y-100:.0f}%" for y in ax1.get_yticks()])
+        ax1_right.set_ylabel("Total Return (%)", rotation=270, labelpad=20, weight='bold', color=self.colors['neutral'])
+        ax1_right.grid(False)
+
+        if final_pct != 0.0 and len(plot_values) > 0:
+            val = plot_values[-1]
+            ret = final_pct
+            color = self.colors['profit'] if ret >= 0 else self.colors['loss']
+            ax1.annotate(f"{ret:+.2f}%", xy=(x_numeric[-1], val),
+                             xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
+                             bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
+
+        # Estimate capital
+        est_capital = 0.0
+        if 'portfolio_value' in df_all.columns:
+            try:
+                equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
+                total_capital_series = equity_matrix.ffill().fillna(0.0).sum(axis=1)
+                est_capital = total_capital_series.max()
+            except: pass
+        
+        ax1.set_title(f"Aggregated Performance (Est Peak AUM: ${est_capital:,.0f})", loc='left')
+        ax1.set_ylabel("Equity (Base 100)")
+        ax1.legend(loc='upper left')
+
+        # 2. Pair Returns Ranking
+        pair_names = [p.get('pair', 'Unknown') for p in pair_summaries]
+        pair_returns = [p.get('cum_return', 0.0) * 100 for p in pair_summaries]
+        
+        ax2 = fig.add_subplot(gs[1, :])
+        if pair_names:
+            colors = [self.colors['profit'] if r > 0 else self.colors['loss'] for r in pair_returns]
+            ax2.bar(pair_names, pair_returns, color=colors, alpha=0.8, width=0.6)
+            ax2.axhline(0, color='black', lw=1)
+            ax2.set_title("Individual Pair Contribution (%)", loc='left')
+            ax2.set_ylabel("Return %")
+            if len(pair_names) > 10:
+                plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
+        else:
+            ax2.text(0.5, 0.5, "No Pair Data Available", ha='center')
+
+        # 3. Correlation Analysis
+        pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
+        pnl_matrix = pnl_matrix.ffill().fillna(0.0)
+        pnl_changes = pnl_matrix.diff().fillna(0.0)
+        
+        if pnl_changes.shape[1] > 1:
+            corr_matrix = pnl_changes.corr()
+            mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+            
+            # 3a. Histogram
+            corr_values = corr_matrix.where(mask).stack().values
+            ax3 = fig.add_subplot(gs[2, 0])
+            if len(corr_values) > 0:
+                sns.histplot(corr_values, kde=True, ax=ax3, color=self.colors['zscore'], bins=15, alpha=0.6)
+                ax3.axvline(np.mean(corr_values), color='black', linestyle='--', label=f'Avg: {np.mean(corr_values):.2f}')
+                ax3.legend()
+            ax3.set_title("Diversification Health", loc='left')
+            ax3.set_xlabel("Pairwise Correlation")
+            ax3.set_ylabel("Frequency")
+
+            # 3b. Top Risk Table
+            corr_stacked = corr_matrix.where(mask).stack()
+            if not corr_stacked.empty:
+                corr_stacked.index.names = ['Pair A', 'Pair B'] 
+                corr_pairs = corr_stacked.reset_index()
+                corr_pairs.columns = ['Pair A', 'Pair B', 'Corr']
+                top_corr = corr_pairs.sort_values('Corr', ascending=False).head(8)
+            else:
+                top_corr = pd.DataFrame()
+            
+            ax4 = fig.add_subplot(gs[2, 1])
+            ax4.axis('off')
+            ax4.set_title("⚠️ Concentration Risks", loc='center', color=self.colors['loss'])
+            
+            cell_text_corr = []
+            if not top_corr.empty:
+                for _, row in top_corr.iterrows():
+                    cell_text_corr.append([f"{row['Pair A']} vs {row['Pair B']}", f"{row['Corr']:.2f}"])
+            else:
+                cell_text_corr = [["No significant correlations", "-"]]
+
+            table_corr = ax4.table(cellText=cell_text_corr, colLabels=["Pair Combination", "Correlation"], 
+                                 loc='center', cellLoc='center', bbox=[0, 0, 1, 0.9])
+            table_corr.auto_set_font_size(False)
+            table_corr.set_fontsize(10) # Smaller font
+            
+        else:
+            ax3 = fig.add_subplot(gs[2, :2])
+            ax3.text(0.5, 0.5, "Insufficient Data for Correlation Analysis", ha='center', fontsize=14)
+            ax3.axis('off')
+
+        # 4. Max Drawdown Distribution
+        ax5 = fig.add_subplot(gs[2, 2])
+        pair_dds = [p.get('max_drawdown', 0.0) * 100 for p in pair_summaries]
+        if pair_dds:
+            sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
+            ax5.set_title("Max Drawdown Distribution", loc='left')
+            ax5.set_xlabel("Drawdown %")
+        else:
+            ax5.text(0.5, 0.5, "No Drawdown Data", ha='center')
+            ax5.axis('off')
+
+        # 5. Global Stats Table
+        ax6 = fig.add_subplot(gs[3, :])
+        ax6.axis('off')
+        
+        flat_metrics = [
+            ("Total Net P&L", f"${final_pnl:,.2f}"),
+            ("Total Return", f"{final_pct:+.2f}%"),
+            ("Sharpe Ratio", f"{agg_sharpe:.2f}"),
+            ("Sortino Ratio", f"{agg_sortino:.2f}"),
+            ("Win Rate", f"{global_win_rate*100:.2f}%"),
+            ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
+            ("VaR (95%)", f"{var_95:.4%}"),
+            ("CVaR (95%)", f"{cvar_95:.4%}"),
+            ("Active Pairs", f"{len(pair_names)}"),
+            ("Trades", f"{total_global_trades}")
+        ]
+        
+        col_count = 5 
+        row_count = 2
+        cell_text = [ [] for _ in range(row_count) ]
+        
+        for i, (label, val) in enumerate(flat_metrics):
+            r = i % row_count
+            cell_text[r].extend([label, val])
+
+        table = ax6.table(cellText=cell_text, loc='center', cellLoc='center', bbox=[0.05, 0.2, 0.9, 0.6])
+        table.auto_set_font_size(False)
+        
+        # FIX 4: Reduced font size for the bottom table so "Portfolio Max DD" fits
+        table.set_fontsize(10) 
+        
+        for (row, col), cell in table.get_celld().items():
+            cell.set_edgecolor('white')
+            # Increase height slightly to breathe
+            cell.set_height(0.12) 
+            if col % 2 == 0:
+                cell.set_facecolor('#f7f9f9')
+                cell.set_text_props(weight='bold', color=self.colors['primary'])
+            else:
+                cell.set_facecolor('white')
+                cell.set_text_props(color='black')
+
+        # Save Main Dashboard
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(self.output_dir, f"portfolio_dashboard_{timestamp}.png")
+        plt.savefig(filepath)
+        plt.close()
+        print(f"\n📊 Saved portfolio dashboard: {filepath}")
+    
+    def visualize_executive_summary(self, explanation_text: str):
+        """
+        Writes the Gemini explanation to a plain text file for the Executive Summary.
+        """
+        if not explanation_text:
+            return
+
+        # 1. Format the text for better readability in a text file
+        header = "=== Risk Manager: Executive Summary ==="
+        footer = "=== Generated by AI Supervisor Agent ==="
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Use textwrap to format paragraphs to a sensible width (e.g., 80 characters)
+        wrapper = textwrap.TextWrapper(width=80, replace_whitespace=False)
+        
+        formatted_content = []
+        paragraphs = explanation_text.split('\n')
+        for p in paragraphs:
+            if p.strip():
+                formatted_content.append(wrapper.fill(p))
+            else:
+                formatted_content.append("") # Preserve blank lines
+
+        final_content = [
+            header,
+            f"Report Generated: {timestamp}",
+            "",
+            *formatted_content,
+            "",
+            footer
+        ]
+
+        # 2. Write to a plain text file
+        # Use a file name that is safe for filesystems
+        safe_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"executive_summary_{safe_timestamp}.txt"
+        filepath = os.path.join(self.output_dir, filename)
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(final_content))
+            print(f"📄 Saved executive summary (TXT): {filepath}")
+        except IOError as e:
+            print(f"❌ Error writing executive summary text file: {e}")
+
+    def _calculate_sharpe(self, returns):
+        """Calculates the Annualized Sharpe Ratio."""
+        if len(returns) < 2: return 0.0
+        # Assume daily data, scale risk-free rate to daily
+        rf = CONFIG.get("risk_free_rate", 0.04) / 252 
+        exc = np.array(returns) - rf
+        std = np.std(exc, ddof=1)
+        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
+
+    def _calculate_sortino(self, returns):
+        """Calculates the Annualized Sortino Ratio (Downside Risk only)."""
+        if len(returns) < 2: return 0.0
+        
+        # 1. Define Risk-Free Rate and Excess Returns
+        rf = CONFIG.get("risk_free_rate", 0.04) / 252 
+        returns_np = np.array(returns)
+        exc = returns_np - rf
+        avg_excess_return = np.mean(exc)
+        
+        # 2. Calculate Downside Deviation
+        # We only care about returns that fell BELOW the target (rf)
+        negative_excess_returns = exc[exc < 0]
+        
+        if len(negative_excess_returns) == 0:
+            # If there is no downside risk (no returns below rf), 
+            # Sortino is theoretically infinite. We cap it or return a high value.
+            return 10.0 if avg_excess_return > 0 else 0.0
+    
+        # ddof=1 for sample standard deviation
+        downside_std = np.std(negative_excess_returns, ddof=1)
+        
+        # 3. Calculate Ratio & Annualize
+        if downside_std > 1e-8:
+            return (avg_excess_return / downside_std) * np.sqrt(252)
+        else:
+            return 0.0
+
+def generate_all_visualizations(all_traces: List[Dict], 
+                                 skipped_pairs: List[Dict],
+                                 final_summary: Dict,
+                                 output_dir: str = "reports"):
+    """
+    Generate complete visual report for portfolio and all pairs.
+    """
+    print("\n" + "="*70)
+    print("GENERATING VISUAL REPORTS")
+    print("="*70)
+    
+    visualizer = PortfolioVisualizer(output_dir)
+    
+    # Group traces by pair
+    traces_by_pair = {}
+    for t in all_traces:
+        pair = t.get('pair')
+        if not pair or isinstance(pair, list): continue
+        if pair not in traces_by_pair:
+            traces_by_pair[pair] = []
+        traces_by_pair[pair].append(t)
+    
+    # Generate individual pair reports
+    print("\n📊 Generating pair-level reports...")
+    for pair_name, traces in traces_by_pair.items():
+        skip_info = next((s for s in skipped_pairs if s.get('pair') == pair_name), None)
+        was_skipped = skip_info is not None
+        
+        visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
+    
+    # Generate portfolio aggregate
+    print("\n📊 Generating portfolio aggregate report...")
+    visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
+    
+    # Generate Executive Summary Text Card
+    if 'explanation' in final_summary:
+        print("\n📄 Generating executive summary card...")
+        visualizer.visualize_executive_summary(final_summary['explanation'])
+    
+    print(f"\n✅ All reports saved to: {output_dir}/")
